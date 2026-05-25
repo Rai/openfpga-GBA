@@ -76,10 +76,40 @@ module audio_mixer #(
   end
 
   //! ------------------------------------------------------------------------
+  //! Clock Domain Crossing
+  //! Borrow the FIFO handoff used by openfpga-GBC so audio samples are moved
+  //! from clk_audio into audio_mclk without relying only on a stability check.
+  //! ------------------------------------------------------------------------
+  logic [15:0] core_al_s, core_ar_s;
+  reg          write_en = 0;
+  reg  [15:0] prev_left;
+  reg  [15:0] prev_right;
+
+  sync_fifo #(
+      .WIDTH(32)
+  ) sync_fifo (
+      .clk_write(clk_audio),
+      .clk_read (audio_mclk),
+
+      .write_en(write_en),
+      .data({core_al, core_ar}),
+      .data_s({core_al_s, core_ar_s})
+  );
+
+  always @(posedge clk_audio) begin
+    prev_left  <= core_al;
+    prev_right <= core_ar;
+    write_en   <= 1'b0;
+
+    if (core_al != prev_left || core_ar != prev_right) begin
+      write_en <= 1'b1;
+    end
+  end
+
+  //! ------------------------------------------------------------------------
   //! Audio Output
-  //! CDC is handled by audio_filters' 2-cycle stability check,
-  //! matching MiSTer's audio_out.v approach: core_l/core_r from clk_sys are
-  //! registered twice at audio_mclk and only accepted when stable.
+  //! Samples arrive through the FIFO CDC above; audio_filters still keeps its
+  //! internal stability registers, which are harmless once the input is synced.
   //! IIR low-pass filter removed to conserve ALMs — the Pocket's DAC has
   //! built-in oversampling/interpolation. DC blocker and mix retained.
   //! ------------------------------------------------------------------------
@@ -96,8 +126,8 @@ module audio_mixer #(
       .is_signed(is_signed),
       .mix      (mix),
 
-      .core_l   (core_al),
-      .core_r   (core_ar),
+      .core_l   (core_al_s),
+      .core_r   (core_ar_s),
 
       .audio_l  (audio_l),
       .audio_r  (audio_r)

@@ -55,6 +55,10 @@ output  reg     [31:0]  rtc_date_bcd,
 output  reg     [31:0]  rtc_time_bcd,
 output  reg             rtc_valid,
 
+output  reg             cart_play,
+output  reg             cart_power,
+output  reg     [31:0]  cart_adapter_id,
+
 input   wire            savestate_supported,
 input   wire    [31:0]  savestate_addr,
 input   wire    [31:0]  savestate_size,
@@ -193,6 +197,9 @@ initial begin
     dataslot_update <= 0;
     dataslot_allcomplete <= 0;
     rtc_valid <= 0;
+    cart_play <= 0;
+    cart_power <= 0;
+    cart_adapter_id <= 0;
     savestate_start <= 0;
     savestate_load <= 0;
     osnotify_inmenu <= 0;
@@ -398,6 +405,15 @@ always @(posedge clk) begin
             rtc_epoch_seconds <= host_20;
             rtc_date_bcd <= host_24;
             rtc_time_bcd <= host_28;
+            hstate <= ST_DONE_OK;
+        end
+        16'h00B1: begin
+            // Cartridge adapter state (APF framework 1.2).
+            // host_20[24] = Play Cartridge selected, [16] = cart power enabled,
+            // [7:0] = detected cartridge adapter ID.
+            cart_play <= host_20[24];
+            cart_power <= host_20[16];
+            cart_adapter_id <= {24'd0, host_20[7:0]};
             hstate <= ST_DONE_OK;
         end
         16'h00A0: begin

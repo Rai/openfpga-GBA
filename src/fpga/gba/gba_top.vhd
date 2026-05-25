@@ -33,6 +33,14 @@ entity gba_top is
       CyclesVsyncSpeed      : out    std_logic_vector(31 downto 0); -- debug only for speed measurement, keep open
       SramFlashEnable       : in     std_logic;
       memory_remap          : in     std_logic;
+      cartridge_mode        : in     std_logic := '0';
+      cart_req              : out    std_logic := '0';
+      cart_wr               : out    std_logic := '0';
+      cart_addr             : out    std_logic_vector(27 downto 0) := (others => '0');
+      cart_acc              : out    std_logic_vector(1 downto 0) := (others => '0');
+      cart_wdata            : out    std_logic_vector(31 downto 0) := (others => '0');
+      cart_rdata            : in     std_logic_vector(31 downto 0) := (others => '0');
+      cart_done             : in     std_logic := '0';
       increaseSSHeaderCount : in     std_logic;
       save_state            : in     std_logic;
       load_state            : in     std_logic;
@@ -566,6 +574,14 @@ begin
       MaxPakAddr           => MaxPakAddr_modified,
       SramFlashEnable      => SramFlashEnable,
       memory_remap         => memory_remap,
+      cartridge_mode       => cartridge_mode,
+      cart_req             => cart_req,
+      cart_wr              => cart_wr,
+      cart_addr            => cart_addr,
+      cart_acc             => cart_acc,
+      cart_wdata           => cart_wdata,
+      cart_rdata           => cart_rdata,
+      cart_done            => cart_done,
       
       bitmapdrawmode       => bitmapdrawmode,
       
@@ -976,7 +992,6 @@ begin
    
 
 end architecture;
-
 
 
 

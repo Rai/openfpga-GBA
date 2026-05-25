@@ -230,21 +230,8 @@ assign port_ir_rx_disable = 1;
 // bridge endianness
 assign bridge_endian_little = 0;
 
-// cart is unused, so set all level translators accordingly
-// directions are 0:IN, 1:OUT
-assign cart_tran_bank3 = 8'hzz;
-assign cart_tran_bank3_dir = 1'b0;
-assign cart_tran_bank2 = 8'hzz;
-assign cart_tran_bank2_dir = 1'b0;
-assign cart_tran_bank1 = 8'hzz;
-assign cart_tran_bank1_dir = 1'b0;
-assign cart_tran_bank0 = 4'hf;
-assign cart_tran_bank0_dir = 1'b1;
-assign cart_tran_pin30 = 1'b0;
-assign cart_tran_pin30_dir = 1'bz;
-assign cart_pin30_pwroff_reset = 1'b0;
-assign cart_tran_pin31 = 1'bz;
-assign cart_tran_pin31_dir = 1'b0;
+// Cartridge pins are owned by gba_cart_bus below. It keeps them in the same
+// safe idle/tri-state posture unless APF has selected and powered Play Cartridge.
 
 // link port is unused, set to input only to be safe
 assign port_tran_so = 1'bz;
@@ -570,6 +557,125 @@ wire        bus_out_rnw;    // 1=read, 0=write
 wire        bus_out_ena;    // Request strobe
 reg         bus_out_done;
 
+// Physical cartridge transaction interface from gba_top/gba_memorymux.
+wire        gba_cart_req;
+wire        gba_cart_wr;
+wire [27:0] gba_cart_addr;
+wire [1:0]  gba_cart_acc;
+wire [31:0] gba_cart_wdata;
+wire [31:0] cart_bus_rdata;
+wire        cart_bus_done;
+wire        cart_bus_busy;
+
+reg         probe_cart_req;
+reg  [27:0] probe_cart_addr;
+
+// Bring-up diagnostic: let the BIOS own the cartridge bus directly. The
+// pre-boot probe can mask cart-bus failures by holding the GBA in reset.
+// ROM cache fills also use this physical bus in cartridge mode; direct
+// gba_cart_* requests are still used for saves and GPIO/RTC.
+wire        cart_fill_req;
+wire [27:0] cart_fill_addr;
+wire        cart_fill_active;
+
+wire        cart_bus_req   = cart_mode_s & (cart_fill_req | (!cart_fill_active & gba_cart_req));
+wire        cart_bus_wr    = cart_fill_active ? 1'b0 : gba_cart_wr;
+wire [27:0] cart_bus_addr  = cart_fill_active ? cart_fill_addr : gba_cart_addr;
+wire [1:0]  cart_bus_acc   = cart_fill_active ? 2'b10 : gba_cart_acc;
+wire [31:0] cart_bus_wdata = cart_fill_active ? 32'd0 : gba_cart_wdata;
+wire        gba_cart_done  = cart_mode_s & !cart_fill_active & cart_bus_done;
+
+gba_cart_bus cart_bus (
+    .clk                    ( clk_sys ),
+    .reset                  ( ~pll_core_locked ),
+    .cart_mode              ( cart_mode_s ),
+
+    .req                    ( cart_bus_req ),
+    .wr                     ( cart_bus_wr ),
+    .addr                   ( cart_bus_addr ),
+    .acc                    ( cart_bus_acc ),
+    .wdata                  ( cart_bus_wdata ),
+    .rdata                  ( cart_bus_rdata ),
+    .done                   ( cart_bus_done ),
+    .busy                   ( cart_bus_busy ),
+
+    .cart_tran_bank2        ( cart_tran_bank2 ),
+    .cart_tran_bank2_dir    ( cart_tran_bank2_dir ),
+    .cart_tran_bank3        ( cart_tran_bank3 ),
+    .cart_tran_bank3_dir    ( cart_tran_bank3_dir ),
+    .cart_tran_bank1        ( cart_tran_bank1 ),
+    .cart_tran_bank1_dir    ( cart_tran_bank1_dir ),
+    .cart_tran_bank0        ( cart_tran_bank0 ),
+    .cart_tran_bank0_dir    ( cart_tran_bank0_dir ),
+    .cart_tran_pin30        ( cart_tran_pin30 ),
+    .cart_tran_pin30_dir    ( cart_tran_pin30_dir ),
+    .cart_pin30_pwroff_reset( cart_pin30_pwroff_reset ),
+    .cart_tran_pin31        ( cart_tran_pin31 ),
+    .cart_tran_pin31_dir    ( cart_tran_pin31_dir )
+);
+
+localparam CART_PROBE_IDLE   = 3'd0;
+localparam CART_PROBE_READ0  = 3'd1;
+localparam CART_PROBE_WAIT0  = 3'd2;
+localparam CART_PROBE_READ1  = 3'd3;
+localparam CART_PROBE_WAIT1  = 3'd4;
+localparam CART_PROBE_DONE   = 3'd5;
+
+reg [2:0]  cart_probe_state;
+reg [15:0] cart_id_word0;
+
+always @(posedge clk_sys) begin
+    probe_cart_req <= 1'b0;
+
+    if (~pll_core_locked || ~cart_mode_s) begin
+        cart_probe_state <= CART_PROBE_IDLE;
+        physical_cart_id <= 32'd0;
+        physical_cart_id_valid <= 1'b0;
+        physical_cart_invalid <= 1'b0;
+        cart_id_word0 <= 16'd0;
+    end else begin
+        case (cart_probe_state)
+            CART_PROBE_IDLE: begin
+                physical_cart_id_valid <= 1'b0;
+                physical_cart_invalid <= 1'b0;
+                if (dataslot_allcomplete_s) begin
+                    probe_cart_addr <= 28'h00000AC;
+                    cart_probe_state <= CART_PROBE_READ0;
+                end
+            end
+            CART_PROBE_READ0: begin
+                probe_cart_req <= 1'b1;
+                cart_probe_state <= CART_PROBE_WAIT0;
+            end
+            CART_PROBE_WAIT0: begin
+                if (cart_bus_done) begin
+                    cart_id_word0 <= cart_bus_rdata[15:0];
+                    probe_cart_addr <= 28'h00000AE;
+                    cart_probe_state <= CART_PROBE_READ1;
+                end
+            end
+            CART_PROBE_READ1: begin
+                probe_cart_req <= 1'b1;
+                cart_probe_state <= CART_PROBE_WAIT1;
+            end
+            CART_PROBE_WAIT1: begin
+                if (cart_bus_done) begin
+                    physical_cart_id <= {cart_id_word0[7:0], cart_id_word0[15:8],
+                                         cart_bus_rdata[7:0], cart_bus_rdata[15:8]};
+                    physical_cart_invalid <= ((cart_id_word0 == 16'h0000) && (cart_bus_rdata[15:0] == 16'h0000)) ||
+                                             ((cart_id_word0 == 16'hFFFF) && (cart_bus_rdata[15:0] == 16'hFFFF));
+                    physical_cart_id_valid <= 1'b1;
+                    cart_probe_state <= CART_PROBE_DONE;
+                end
+            end
+            CART_PROBE_DONE: begin
+                physical_cart_id_valid <= 1'b1;
+            end
+            default: cart_probe_state <= CART_PROBE_IDLE;
+        endcase
+    end
+end
+
 // Arbitration state machine
 localparam BUS_IDLE       = 3'd0;
 localparam BUS_EWRAM_WAIT = 3'd1;  // Wait for SDRAM ch2 to complete EWRAM access
@@ -714,6 +820,70 @@ wire [31:0] sdram_rd_data_second;
 wire        sdram_read_req_gba;
 wire [24:0] sdram_read_addr_gba;
 
+localparam [2:0] CART_FILL_IDLE  = 3'd0;
+localparam [2:0] CART_FILL_REQ0  = 3'd1;
+localparam [2:0] CART_FILL_WAIT0 = 3'd2;
+localparam [2:0] CART_FILL_REQ1  = 3'd3;
+localparam [2:0] CART_FILL_WAIT1 = 3'd4;
+
+reg [2:0]  cart_fill_state;
+reg [24:0] cart_fill_dword_addr;
+reg [31:0] cart_fill_data0;
+reg [31:0] cart_fill_data1;
+reg        cart_fill_done;
+
+assign cart_fill_active = cart_fill_state != CART_FILL_IDLE;
+assign cart_fill_req    = cart_fill_state == CART_FILL_REQ0 || cart_fill_state == CART_FILL_REQ1;
+assign cart_fill_addr   = {1'b0, cart_fill_dword_addr, 2'b00};
+
+always @(posedge clk_sys) begin
+    cart_fill_done <= 1'b0;
+
+    if (~pll_core_locked || !cart_mode_s) begin
+        cart_fill_state      <= CART_FILL_IDLE;
+        cart_fill_dword_addr <= 25'd0;
+        cart_fill_data0      <= 32'd0;
+        cart_fill_data1      <= 32'd0;
+    end else begin
+        case (cart_fill_state)
+            CART_FILL_IDLE: begin
+                if (sdram_read_req_gba) begin
+                    cart_fill_dword_addr <= sdram_read_addr_gba;
+                    cart_fill_state      <= CART_FILL_REQ0;
+                end
+            end
+
+            CART_FILL_REQ0: begin
+                cart_fill_state <= CART_FILL_WAIT0;
+            end
+
+            CART_FILL_WAIT0: begin
+                if (cart_bus_done) begin
+                    cart_fill_data0      <= cart_bus_rdata;
+                    cart_fill_dword_addr <= {cart_fill_dword_addr[24:1], ~cart_fill_dword_addr[0]};
+                    cart_fill_state      <= CART_FILL_REQ1;
+                end
+            end
+
+            CART_FILL_REQ1: begin
+                cart_fill_state <= CART_FILL_WAIT1;
+            end
+
+            CART_FILL_WAIT1: begin
+                if (cart_bus_done) begin
+                    cart_fill_data1 <= cart_bus_rdata;
+                    cart_fill_done  <= 1'b1;
+                    cart_fill_state <= CART_FILL_IDLE;
+                end
+            end
+
+            default: begin
+                cart_fill_state <= CART_FILL_IDLE;
+            end
+        endcase
+    end
+end
+
 // Write interface — from ROM data_loader (active during boot)
 wire        rom_loader_wr;
 wire [27:0] rom_loader_addr;
@@ -735,7 +905,7 @@ wire [15:0] sdram_wr_data_mux = ss_sdram_wr_req  ? ss_sdram_wr_data : rom_loader
 
 // Mux SDRAM ch1 read port: ROM reads OR staging reads
 // During Phase 2 core is paused (sleep_savestate), no ROM reads conflict.
-wire        sdram_rd_req_mux  = ss_serving_active ? ss_sdram_rd_req     : sdram_read_req_gba;
+wire        sdram_rd_req_mux  = ss_serving_active ? ss_sdram_rd_req     : (cart_mode_s ? 1'b0 : sdram_read_req_gba);
 wire [24:0] sdram_rd_addr_mux = ss_serving_active ? ss_sdram_rd_addr    : sdram_read_addr_gba;
 
 wire sdram_ready;
@@ -821,6 +991,9 @@ wire [24:0] max_rom_addr = (last_rom_byte_addr + 26'd2) >> 2;
 wire        det_flash_1m;
 wire [31:0] detected_cart_id;
 wire        det_cart_id_valid;
+reg  [31:0] physical_cart_id;
+reg         physical_cart_id_valid;
+reg         physical_cart_invalid;
 
 save_type_detector save_det (
     .clk             ( clk_sys ),
@@ -845,10 +1018,13 @@ wire        quirk_gpio;       // → specialmodule
 wire        quirk_memory_remap; // → memory_remap
 wire        quirk_sprite;     // → maxpixels
 
+wire [31:0] active_cart_id       = cart_mode_s ? physical_cart_id       : detected_cart_id;
+wire        active_cart_id_valid = cart_mode_s ? physical_cart_id_valid : det_cart_id_valid;
+
 cart_quirks quirks (
     .clk           ( clk_sys ),
-    .cart_id       ( detected_cart_id ),
-    .valid         ( det_cart_id_valid ),
+    .cart_id       ( active_cart_id ),
+    .valid         ( active_cart_id_valid ),
     .sram_quirk    ( quirk_sram ),
     .gpio_quirk    ( quirk_gpio ),
     .tilt_quirk    (),
@@ -898,7 +1074,8 @@ wire        rtc_inuse;
 // Save size in clk_sys domain (cart save only, excludes RTC bytes)
 // sram_quirk games may still use EEPROM for saves (e.g. Dragon Ball Z titles),
 // so use the default 64 KB to ensure EEPROM data is persisted.
-wire [23:0] save_size_sys = det_flash_1m  ? 24'h02_0000 :  // 128 KB
+wire [23:0] save_size_sys = cart_mode_s  ? 24'h00_0000 :  // physical cart saves stay on cart
+                              det_flash_1m  ? 24'h02_0000 :  // 128 KB
                                             24'h01_0000;   // 64 KB
 
 // RTC data captured during save loading
@@ -982,7 +1159,8 @@ synch_3 s_reset_n(reset_n, reset_n_s, clk_sys);
 wire core_reset_s;
 synch_3 s_core_reset(core_reset, core_reset_s, clk_sys);
 
-wire reset_gba = ~pll_core_locked | ~dataslot_allcomplete_s | ~reset_n_s | core_reset_s | ~save_mem_ready;
+wire reset_gba = ~pll_core_locked | ~dataslot_allcomplete_s | ~reset_n_s | core_reset_s |
+                 (~save_mem_ready & ~cart_mode_s);
 
 // ---- BIOS Loading via data_loader → gba_top internal BRAM ----
 // BIOS (16 KB) loads from data slot 4 at address 0x3xxxxxxx
@@ -1109,7 +1287,12 @@ wire    [31:0]  rtc_date_bcd;
 wire    [31:0]  rtc_time_bcd;
 wire            rtc_valid;
 
-wire            savestate_supported = 1;
+wire            cart_play;
+wire            cart_power;
+wire    [31:0]  cart_adapter_id;
+
+wire            cart_mode_74a = cart_play & cart_power;
+wire            savestate_supported = ~cart_mode_74a;
 wire    [31:0]  savestate_addr = 32'h40000000;
 wire    [31:0]  savestate_size = 32'h60D18;       // 0x18346 addr-units × 4 bytes
 wire    [31:0]  savestate_maxloadsize = 32'h60D18;
@@ -1196,6 +1379,10 @@ core_bridge_cmd icb (
     .rtc_date_bcd           ( rtc_date_bcd ),
     .rtc_time_bcd           ( rtc_time_bcd ),
     .rtc_valid              ( rtc_valid ),
+
+    .cart_play              ( cart_play ),
+    .cart_power             ( cart_power ),
+    .cart_adapter_id        ( cart_adapter_id ),
 
     .savestate_supported    ( savestate_supported ),
     .savestate_addr         ( savestate_addr ),
@@ -1298,8 +1485,9 @@ synch_3 gpio_quirk_sync (
 // bus_out FSM packs save bytes densely (1 byte per PSRAM byte), so these
 // sizes match the actual save type sizes. No 4× DWORD expansion.
 // Only add 16 bytes for RTC data when the game uses GPIO/RTC or force_rtc is on.
-wire        rtc_active = gpio_quirk_s | force_rtc;
-wire [31:0] save_size_bytes = flash_1m_s ? (32'h0002_0000 + (rtc_active ? 32'd16 : 32'd0)) :
+wire        rtc_active = (gpio_quirk_s | force_rtc) & ~cart_mode_74a;
+wire [31:0] save_size_bytes = cart_mode_74a ? 32'd0 :
+                              flash_1m_s ? (32'h0002_0000 + (rtc_active ? 32'd16 : 32'd0)) :
                                            (32'h0001_0000 + (rtc_active ? 32'd16 : 32'd0));
 
 // Continuously drive datatable port A with save size.
@@ -1352,6 +1540,10 @@ synch_3 force_rtc_sync(force_rtc, force_rtc_s, clk_sys);
 
 wire [1:0] turbo_mode_s;
 synch_3 #(.WIDTH(2)) turbo_mode_sync(turbo_mode, turbo_mode_s, clk_sys);
+
+// ---- CDC: cartridge mode → clk_sys ----
+wire cart_mode_s;
+synch_3 cart_mode_sync(cart_mode_74a, cart_mode_s, clk_sys);
 
 // ============================================================
 // Section 4: Video Output — framebuffer + raster scan
@@ -1555,16 +1747,24 @@ gba_top #(
     .GBA_lockspeed       ( ~fast_forward ),
     .GBA_cputurbo        ( 1'b0 ),
     .GBA_flash_1m        ( det_flash_1m ),
-    .CyclePrecalc        ( 16'd100 ),
+    .CyclePrecalc        ( 16'd256 ),
     .Underclock          ( 2'b00 ),
     .MaxPakAddr          ( max_rom_addr ),
     .CyclesMissing       (),
     .CyclesVsyncSpeed    (),
     .SramFlashEnable     ( ~quirk_sram ),
     .memory_remap        ( quirk_memory_remap ),
+    .cartridge_mode      ( cart_mode_s ),
+    .cart_req            ( gba_cart_req ),
+    .cart_wr             ( gba_cart_wr ),
+    .cart_addr           ( gba_cart_addr ),
+    .cart_acc            ( gba_cart_acc ),
+    .cart_wdata          ( gba_cart_wdata ),
+    .cart_rdata          ( cart_bus_rdata ),
+    .cart_done           ( gba_cart_done ),
     .increaseSSHeaderCount(1'b0),
-    .save_state          ( ss_save ),
-    .load_state          ( ss_load ),
+    .save_state          ( cart_mode_s ? 1'b0 : ss_save ),
+    .load_state          ( cart_mode_s ? 1'b0 : ss_load ),
     .maxpixels           ( quirk_sprite ),
     .specialmodule       ( quirk_gpio | force_rtc_s ),
     // solar/tilt/rumble removed to save ALMs
@@ -1580,10 +1780,10 @@ gba_top #(
     .RTC_inuse           ( rtc_inuse ),
     // SDRAM (ROM reads — muxed with staging in sdram_pocket section)
     .sdram_read_ena      ( sdram_read_req_gba ),
-    .sdram_read_done     ( ss_serving_active ? 1'b0 : sdram_rd_ready ),
+    .sdram_read_done     ( ss_serving_active ? 1'b0 : (cart_mode_s ? cart_fill_done : sdram_rd_ready) ),
     .sdram_read_addr     ( sdram_read_addr_gba ),
-    .sdram_read_data     ( sdram_rd_data ),
-    .sdram_second_dword  ( sdram_rd_data_second ),
+    .sdram_read_data     ( cart_mode_s ? cart_fill_data0 : sdram_rd_data ),
+    .sdram_second_dword  ( cart_mode_s ? cart_fill_data1 : sdram_rd_data_second ),
     // External memory (EWRAM + saves via PSRAM)
     .bus_out_Din         ( bus_out_Din ),
     .bus_out_Dout        ( bus_out_Dout ),
