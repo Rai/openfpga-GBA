@@ -48,6 +48,7 @@ localparam [3:0] ST_WRITE      = 4'd5;
 localparam [3:0] ST_WRITE_HOLD = 4'd6;
 localparam [3:0] ST_DONE       = 4'd7;
 localparam [3:0] ST_READ_SEQ   = 4'd8;
+localparam [3:0] ST_WRITE_SETUP = 4'd9;
 
 localparam [7:0] ADDR_HOLD_COUNT   = ADDR_HOLD_CYCLES % 256;
 localparam [7:0] ADDR_LATCH_COUNT  = ADDR_LATCH_CYCLES % 256;
@@ -74,14 +75,19 @@ reg        rd_n;
 reg        wr_n;
 reg        cs1_n;
 reg        cs2_n;
+reg        eeprom_selected;
+reg        eeprom_last_wr;
 reg        phi_clk;
 reg [2:0]  phi_div;
 
+wire eeprom_space = latched_addr[27:24] == 4'hD;
+wire req_eeprom_space = addr[27:24] == 4'hD;
+wire eeprom_dir_change = eeprom_selected && req_eeprom_space && (wr != eeprom_last_wr);
 wire save_space = latched_addr[27:24] == 4'hE || latched_addr[27:24] == 4'hF;
 wire gpio_space = latched_addr[27:24] == 4'h8 &&
                   latched_addr[23:0] >= 24'h0000C4 &&
                   latched_addr[23:0] <= 24'h0000C8;
-wire cart_write_enable = latched_wr && (save_space || gpio_space);
+wire cart_write_enable = latched_wr && (eeprom_space || save_space || gpio_space);
 wire wr_n_pin = (state == ST_WRITE && cart_write_enable) ? wr_n : 1'b1;
 wire need_second_beat = latched_acc != ACCESS_8BIT && latched_acc != ACCESS_16BIT;
 wire transaction_active = state != ST_IDLE && state != ST_DONE;
@@ -150,15 +156,21 @@ always @(posedge clk) begin
         wr_n <= 1'b1;
         cs1_n <= 1'b1;
         cs2_n <= 1'b1;
+        eeprom_selected <= 1'b0;
+        eeprom_last_wr <= 1'b0;
     end else begin
         case (state)
             ST_IDLE: begin
                 ad_drive <= 1'b0;
                 rd_n <= 1'b1;
                 wr_n <= 1'b1;
-                cs1_n <= 1'b1;
+                cs1_n <= eeprom_selected ? 1'b0 : 1'b1;
                 cs2_n <= 1'b1;
                 if (req) begin
+                    if (eeprom_selected && (!req_eeprom_space || eeprom_dir_change)) begin
+                        eeprom_selected <= 1'b0;
+                        cs1_n <= 1'b1;
+                    end
                     latched_wr <= wr;
                     latched_addr <= addr;
                     latched_acc <= acc;
@@ -173,7 +185,7 @@ always @(posedge clk) begin
                 ad_drive <= 1'b1;
                 ad_out <= addr_word;
                 a_hi_out <= addr_high;
-                cs1_n <= 1'b1;
+                cs1_n <= eeprom_space ? 1'b0 : 1'b1;
                 cs2_n <= 1'b1;
                 rd_n <= 1'b1;
                 wr_n <= 1'b1;
@@ -194,8 +206,14 @@ always @(posedge clk) begin
                 rd_n <= 1'b1;
                 wr_n <= 1'b1;
                 if (wait_count == 8'd0) begin
-                    wait_count <= latched_wr ? WRITE_SETUP_COUNT : READ_TURN_COUNT;
-                    state <= latched_wr ? ST_WRITE : ST_READ_TURN;
+                    if (latched_wr) begin
+                        ad_out <= save_space ? addr_word : write_word;
+                        wait_count <= WRITE_SETUP_COUNT;
+                        state <= ST_WRITE_SETUP;
+                    end else begin
+                        wait_count <= READ_TURN_COUNT;
+                        state <= ST_READ_TURN;
+                    end
                 end else begin
                     wait_count <= wait_count - 8'd1;
                 end
@@ -270,6 +288,17 @@ always @(posedge clk) begin
                 end
             end
 
+            ST_WRITE_SETUP: begin
+                // Put write data on AD before WR# falls. EEPROM samples a
+                // serial bit on AD0, so data and WR# must not change together.
+                ad_drive <= 1'b1;
+                ad_out <= save_space ? addr_word : write_word;
+                rd_n <= 1'b1;
+                wr_n <= 1'b1;
+                wait_count <= WRITE_SETUP_COUNT;
+                state <= ST_WRITE;
+            end
+
             ST_WRITE: begin
                 ad_drive <= 1'b1;
                 ad_out <= save_space ? addr_word : write_word;
@@ -304,8 +333,12 @@ always @(posedge clk) begin
                 ad_drive <= 1'b0;
                 rd_n <= 1'b1;
                 wr_n <= 1'b1;
-                cs1_n <= 1'b1;
+                cs1_n <= eeprom_space ? 1'b0 : 1'b1;
                 cs2_n <= 1'b1;
+                if (eeprom_space) begin
+                    eeprom_selected <= 1'b1;
+                    eeprom_last_wr <= latched_wr;
+                end
                 done <= 1'b1;
                 state <= ST_IDLE;
             end

@@ -39,6 +39,8 @@ assign bank2 = cart_read_active ? cart_drive_data[15:8] : 8'hzz;
 reg use_rom_sequence = 1'b0;
 integer rom_rd_count = 0;
 reg cs_rose_between_seq = 1'b0;
+reg monitor_eeprom_hold = 1'b0;
+reg eeprom_cs_rose = 1'b0;
 
 always @(negedge bank0[5]) begin
     #1;
@@ -56,11 +58,36 @@ always @(posedge bank0[4]) begin
     #1;
     if (use_rom_sequence && busy && rom_rd_count == 1)
         cs_rose_between_seq <= 1'b1;
+    if (monitor_eeprom_hold)
+        eeprom_cs_rose <= 1'b1;
 end
 
 reg [7:0] save_drive_data = 8'hA5;
 wire save_read_active = cart_mode && !bank1_dir && (pin30 == 1'b0) && (bank0[5] == 1'b0);
 assign bank1 = save_read_active ? save_drive_data : 8'hzz;
+
+reg monitor_eeprom_write = 1'b0;
+reg eeprom_write_seen = 1'b0;
+reg eeprom_write_setup_seen = 1'b0;
+reg [15:0] eeprom_expected_write = 16'h0000;
+always @(posedge clk) begin
+    #1;
+    if (monitor_eeprom_write && bank0[6] === 1'b1 && bank0[4] === 1'b0 &&
+        bank3_dir === 1'b1 && bank2_dir === 1'b1 && {bank2, bank3} === eeprom_expected_write) begin
+        eeprom_write_setup_seen <= 1'b1;
+    end
+    if (monitor_eeprom_write && bank0[6] === 1'b0) begin
+        eeprom_write_seen <= 1'b1;
+        if (!eeprom_write_setup_seen)
+            $fatal(1, "EEPROM write data was not setup before WR# asserted");
+        if (bank0[4] !== 1'b0 || pin30 !== 1'b1)
+            $fatal(1, "EEPROM write did not select CS1 only");
+        if (bank3_dir !== 1'b1 || bank2_dir !== 1'b1)
+            $fatal(1, "EEPROM write did not drive AD data");
+        if ({bank2, bank3} !== eeprom_expected_write)
+            $fatal(1, "EEPROM write data was %h", {bank2, bank3});
+    end
+end
 
 always @(posedge clk) begin
     #1;
@@ -161,6 +188,47 @@ initial begin
         $fatal(1, "CS2 did not return high after save write");
     if (bank0[6] !== 1'b1)
         $fatal(1, "WR# did not return high after write");
+
+    eeprom_write_seen <= 1'b0;
+    eeprom_write_setup_seen <= 1'b0;
+    eeprom_expected_write <= 16'h0001;
+    monitor_eeprom_write <= 1'b1;
+    pulse_req(1'b1, 28'hD000000, 2'b01, 32'h00000001);
+    monitor_eeprom_write <= 1'b0;
+    if (!eeprom_write_seen)
+        $fatal(1, "EEPROM write never asserted WR#");
+    if (bank0[4] !== 1'b0)
+        $fatal(1, "EEPROM CS1 was not held after first serial bit");
+
+    eeprom_cs_rose <= 1'b0;
+    monitor_eeprom_hold <= 1'b1;
+    eeprom_write_seen <= 1'b0;
+    eeprom_write_setup_seen <= 1'b0;
+    eeprom_expected_write <= 16'h0000;
+    monitor_eeprom_write <= 1'b1;
+    pulse_req(1'b1, 28'hD000000, 2'b01, 32'h00000000);
+    monitor_eeprom_write <= 1'b0;
+    monitor_eeprom_hold <= 1'b0;
+    if (!eeprom_write_seen)
+        $fatal(1, "second EEPROM write never asserted WR#");
+    if (eeprom_cs_rose)
+        $fatal(1, "EEPROM CS1 rose between serial bit writes");
+    if (bank0[4] !== 1'b0)
+        $fatal(1, "EEPROM CS1 was not held after second serial bit");
+
+    eeprom_cs_rose <= 1'b0;
+    monitor_eeprom_hold <= 1'b1;
+    pulse_req(1'b0, 28'hD000000, 2'b01, 32'd0);
+    monitor_eeprom_hold <= 1'b0;
+    if (!eeprom_cs_rose)
+        $fatal(1, "EEPROM CS1 did not release on write-to-read direction change");
+    if (bank0[4] !== 1'b0)
+        $fatal(1, "EEPROM CS1 was not held after first read bit");
+
+    cart_drive_data <= 16'h1234;
+    pulse_req(1'b0, 28'h0000120, 2'b01, 32'd0);
+    if (bank0[4] !== 1'b1)
+        $fatal(1, "EEPROM CS1 did not release on non-EEPROM access");
 
     cart_mode <= 1'b0;
     repeat (2) @(posedge clk);
