@@ -10,6 +10,7 @@ Desktop.ini
 .claude/
 .vscode/
 .idea/
+.codegraph/
 
 # Quartus build artifacts
 output_files/
